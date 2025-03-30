@@ -31,7 +31,7 @@ from torchvision.transforms.v2 import (
 )
 
 from unet import UNet
-
+from utils import compute_pixel_accuracy, compute_mIoU
 
 # Mapping class IDs to train IDs
 id_to_trainid = {cls.id: cls.train_id for cls in Cityscapes.classes}
@@ -136,6 +136,16 @@ def main(args):
         n_classes=19,  # 19 classes in the Cityscapes dataset
     ).to(device)
 
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    model_size_mb = total_params * 4 / (1024 ** 2)
+
+    wandb.log({
+        "model/total_params": total_params,
+        "model/trainable_params": trainable_params,
+        "model/size_MB": model_size_mb,
+    })
+
     # Define the loss function
     criterion = nn.CrossEntropyLoss(ignore_index=255)  # Ignore the void class
 
@@ -173,6 +183,8 @@ def main(args):
         model.eval()
         with torch.no_grad():
             losses = []
+            total_acc, total_iou = 0.0, 0.0
+
             for i, (images, labels) in enumerate(valid_dataloader):
 
                 labels = convert_to_train_id(labels)  # Convert class IDs to train IDs
@@ -183,7 +195,14 @@ def main(args):
                 outputs = model(images)
                 loss = criterion(outputs, labels)
                 losses.append(loss.item())
-            
+
+                predictions = outputs.argmax(1)
+                acc = compute_pixel_accuracy(predictions, labels)
+                miou = compute_mIoU(predictions, labels)
+
+                total_acc += acc
+                total_iou += miou
+
                 if i == 0:
                     predictions = outputs.softmax(1).argmax(1)
 
@@ -208,6 +227,16 @@ def main(args):
             wandb.log({
                 "valid_loss": valid_loss
             }, step=(epoch + 1) * len(train_dataloader) - 1)
+
+            avg_acc = total_acc / len(valid_dataloader)
+            avg_miou = total_iou / len(valid_dataloader)
+
+            wandb.log({
+                "valid_loss": valid_loss,
+                "pixel_accuracy": avg_acc,
+                "mIoU": avg_miou,
+            }, step=(epoch + 1) * len(train_dataloader) - 1)
+
 
             if valid_loss < best_valid_loss:
                 best_valid_loss = valid_loss
