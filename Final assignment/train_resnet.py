@@ -1,17 +1,4 @@
-"""
-This script implements a training loop for the model. It is designed to be flexible, 
-allowing you to easily modify hyperparameters using a command-line argument parser.
 
-### Key Features:
-1. **Hyperparameter Tuning:** Adjust hyperparameters by parsing arguments from the `main.sh` script or directly 
-   via the command line.
-2. **Remote Execution Support:** Since this script runs on a server, training progress is not visible on the console. 
-   To address this, we use the `wandb` library for logging and tracking progress and results.
-3. **Encapsulation:** The training loop is encapsulated in a function, enabling it to be called from the main block. 
-   This ensures proper execution when the script is run directly.
-
-Feel free to customize the script as needed for your use case.
-"""
 import os
 from argparse import ArgumentParser
 
@@ -29,9 +16,12 @@ from torchvision.transforms.v2 import (
     ToImage,
     ToDtype,
 )
+from utils import compute_pixel_accuracy, compute_mIoU, compute_mean_DICE
 
-from unet import UNet
-from utils import compute_pixel_accuracy, compute_mIoU
+from torchvision.models.segmentation import (
+    DeepLabV3_ResNet101_Weights,
+    deeplabv3_resnet101,
+)
 
 # Mapping class IDs to train IDs
 id_to_trainid = {cls.id: cls.train_id for cls in Cityscapes.classes}
@@ -95,7 +85,7 @@ def main(args):
         ToImage(),
         Resize((256, 256)),
         ToDtype(torch.float32, scale=True),
-        Normalize((0.5,), (0.5,)),
+        Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
     ])
 
     # Load the dataset and make a split for training and validation
@@ -130,11 +120,8 @@ def main(args):
         num_workers=args.num_workers
     )
 
-    # Define the model
-    model = UNet(
-        in_channels=3,  # RGB images
-        n_classes=19,  # 19 classes in the Cityscapes dataset
-    ).to(device)
+    weights = DeepLabV3_ResNet101_Weights.COCO_WITH_VOC_LABELS_V1
+    model = deeplabv3_resnet101(weights=weights).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -146,11 +133,22 @@ def main(args):
         "model/size_MB": model_size_mb,
     })
 
-    # Define the loss function
-    criterion = nn.CrossEntropyLoss(ignore_index=255)  # Ignore the void class
+    # Replace the classifier head with your own (19 classes for Cityscapes)
+    model.classifier[4] = torch.nn.Conv2d(256, 19, kernel_size=1).to(device)
 
-    # Define the optimizer
-    optimizer = AdamW(model.parameters(), lr=args.lr)
+    # Unfreeze the backbone
+    for param in model.backbone.parameters():
+        param.requires_grad = True
+
+    # Set up optimizer with differential learning rates
+    # Backbone gets a lower LR (e.g., 0.1x), classifier gets the full LR
+    optimizer = AdamW([
+        {"params": model.backbone.parameters(), "lr": args.lr * 0.1},
+        {"params": model.classifier.parameters(), "lr": args.lr},
+    ])
+
+    # Define the loss function
+    criterion = nn.CrossEntropyLoss(ignore_index=255)
 
     # Training loop
     best_valid_loss = float('inf')
@@ -168,7 +166,7 @@ def main(args):
             labels = labels.long().squeeze(1)  # Remove channel dimension
 
             optimizer.zero_grad()
-            outputs = model(images)
+            outputs = model(images)['out']
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
@@ -183,7 +181,7 @@ def main(args):
         model.eval()
         with torch.no_grad():
             losses = []
-            total_acc, total_iou = 0.0, 0.0
+            total_acc, total_iou, total_dice = 0, 0, 0
 
             for i, (images, labels) in enumerate(valid_dataloader):
 
@@ -192,17 +190,19 @@ def main(args):
 
                 labels = labels.long().squeeze(1)  # Remove channel dimension
 
-                outputs = model(images)
+                outputs = model(images)['out']
                 loss = criterion(outputs, labels)
                 losses.append(loss.item())
 
                 predictions = outputs.argmax(1)
                 acc = compute_pixel_accuracy(predictions, labels)
                 miou = compute_mIoU(predictions, labels)
+                dice = compute_mean_DICE(predictions, labels)
 
                 total_acc += acc
                 total_iou += miou
-
+                total_dice += dice
+            
                 if i == 0:
                     predictions = outputs.softmax(1).argmax(1)
 
@@ -226,11 +226,13 @@ def main(args):
             valid_loss = sum(losses) / len(losses)
             avg_acc = total_acc / len(valid_dataloader)
             avg_miou = total_iou / len(valid_dataloader)
+            avg_dice = total_dice / len(valid_dataloader)
 
             wandb.log({
                 "valid_loss": valid_loss,
                 "pixel_accuracy": avg_acc,
                 "mIoU": avg_miou,
+                "mean_DICE": avg_dice
             }, step=(epoch + 1) * len(train_dataloader) - 1)
 
 

@@ -1,17 +1,4 @@
-"""
-This script implements a training loop for the model. It is designed to be flexible, 
-allowing you to easily modify hyperparameters using a command-line argument parser.
 
-### Key Features:
-1. **Hyperparameter Tuning:** Adjust hyperparameters by parsing arguments from the `main.sh` script or directly 
-   via the command line.
-2. **Remote Execution Support:** Since this script runs on a server, training progress is not visible on the console. 
-   To address this, we use the `wandb` library for logging and tracking progress and results.
-3. **Encapsulation:** The training loop is encapsulated in a function, enabling it to be called from the main block. 
-   This ensures proper execution when the script is run directly.
-
-Feel free to customize the script as needed for your use case.
-"""
 import os
 from argparse import ArgumentParser
 
@@ -29,9 +16,12 @@ from torchvision.transforms.v2 import (
     ToImage,
     ToDtype,
 )
-
-from unet import UNet
 from utils import compute_pixel_accuracy, compute_mIoU
+
+from torchvision.models.segmentation import (
+    deeplabv3_mobilenet_v3_large,
+    DeepLabV3_MobileNet_V3_Large_Weights,
+)
 
 # Mapping class IDs to train IDs
 id_to_trainid = {cls.id: cls.train_id for cls in Cityscapes.classes}
@@ -95,7 +85,7 @@ def main(args):
         ToImage(),
         Resize((256, 256)),
         ToDtype(torch.float32, scale=True),
-        Normalize((0.5,), (0.5,)),
+        Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
     ])
 
     # Load the dataset and make a split for training and validation
@@ -130,11 +120,8 @@ def main(args):
         num_workers=args.num_workers
     )
 
-    # Define the model
-    model = UNet(
-        in_channels=3,  # RGB images
-        n_classes=19,  # 19 classes in the Cityscapes dataset
-    ).to(device)
+    weights = DeepLabV3_MobileNet_V3_Large_Weights.COCO_WITH_VOC_LABELS_V1
+    model = deeplabv3_mobilenet_v3_large(weights=weights).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -146,11 +133,22 @@ def main(args):
         "model/size_MB": model_size_mb,
     })
 
-    # Define the loss function
-    criterion = nn.CrossEntropyLoss(ignore_index=255)  # Ignore the void class
+    # Replace the classifier head with your own (19 classes for Cityscapes)
+    model.classifier[4] = torch.nn.Conv2d(256, 19, kernel_size=1).to(device)
 
-    # Define the optimizer
-    optimizer = AdamW(model.parameters(), lr=args.lr)
+    # Unfreeze the backbone
+    for param in model.backbone.parameters():
+        param.requires_grad = True
+
+    # Set up optimizer with differential learning rates
+    # Backbone gets a lower LR (e.g., 0.1x), classifier gets the full LR
+    optimizer = AdamW([
+        {"params": model.backbone.parameters(), "lr": args.lr * 0.1},
+        {"params": model.classifier.parameters(), "lr": args.lr},
+    ])
+
+    # Define the loss function
+    criterion = nn.CrossEntropyLoss(ignore_index=255)
 
     # Training loop
     best_valid_loss = float('inf')
@@ -168,7 +166,7 @@ def main(args):
             labels = labels.long().squeeze(1)  # Remove channel dimension
 
             optimizer.zero_grad()
-            outputs = model(images)
+            outputs = model(images)['out']
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
@@ -192,7 +190,7 @@ def main(args):
 
                 labels = labels.long().squeeze(1)  # Remove channel dimension
 
-                outputs = model(images)
+                outputs = model(images)['out']
                 loss = criterion(outputs, labels)
                 losses.append(loss.item())
 
@@ -202,7 +200,7 @@ def main(args):
 
                 total_acc += acc
                 total_iou += miou
-
+            
                 if i == 0:
                     predictions = outputs.softmax(1).argmax(1)
 
