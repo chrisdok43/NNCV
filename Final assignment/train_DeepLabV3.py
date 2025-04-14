@@ -5,12 +5,21 @@ from argparse import ArgumentParser
 import wandb
 import torch
 import torch.nn as nn
+from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from torchvision.datasets import Cityscapes, wrap_dataset_for_transforms_v2
 from torchvision.utils import make_grid
+from torchvision.transforms.v2 import (
+    Compose,
+    Normalize,
+    Resize,
+    ToImage,
+    ToDtype,
+)
 import torchvision.models.segmentation as models
-from torchvision.models.segmentation import DeepLabV3_ResNet50_Weights, DeepLabV3_ResNet101_Weights
+from torchvision.models.segmentation import DeepLabV3_ResNet50_Weights
 
+from torch import optim 
 from utils import *
 
 # Mapping class IDs to train IDs
@@ -63,14 +72,12 @@ def train(loader, model, optimizer, criterion, epoch, device=None):
     return avg_loss
 
 @torch.no_grad()
-def validate(model, loader, criterion, epoch, train_loader_len, device=None):
-    print("Validating...")
+def validate(model, loader, criterion, epoch, output_dir, current_best_model_path=None, device=None):
     model.eval()
     total_loss = 0.0
-    total_acc, total_iou, total_dice = 0, 0, 0
+    total_acc, total_iou = 0.0, 0.0
 
     for i, (images, labels) in enumerate(loader):
-        print(f"Batch in Validating {i+1}/{len(loader)}")
         images = images.to(device)
         labels = labels.to(device)
 
@@ -85,11 +92,8 @@ def validate(model, loader, criterion, epoch, train_loader_len, device=None):
         predictions = outputs.argmax(1)
         acc = compute_pixel_accuracy(predictions, labels)
         miou = compute_mIoU(predictions, labels)
-        dice = compute_mean_DICE(predictions, labels)
-
         total_acc += acc
         total_iou += miou
-        total_dice += dice
 
         if i == 0:
             predictions = outputs.softmax(1).argmax(1)
@@ -97,8 +101,8 @@ def validate(model, loader, criterion, epoch, train_loader_len, device=None):
             predictions = predictions.unsqueeze(1)
             labels = labels.unsqueeze(1)
 
-            predictions = convert_train_id_to_color(predictions, train_id_to_color)
-            labels = convert_train_id_to_color(labels, train_id_to_color)
+            predictions = convert_train_id_to_color(predictions)
+            labels = convert_train_id_to_color(labels)
 
             predictions_img = make_grid(predictions.cpu(), nrow=8)
             labels_img = make_grid(labels.cpu(), nrow=8)
@@ -109,24 +113,16 @@ def validate(model, loader, criterion, epoch, train_loader_len, device=None):
             wandb.log({
                 "predictions": [wandb.Image(predictions_img)],
                 "labels": [wandb.Image(labels_img)],
-            }, step=(epoch + 1) * train_loader_len - 1)
-
-    print(f"Validation Loss: {total_loss / len(loader)}")
-    print(f"Pixel Accuracy: {total_acc / len(loader)}")
-    print(f"Mean IoU: {total_iou / len(loader)}")
-    print(f"Mean DICE: {total_dice / len(loader)}")
-
+            }, step=(epoch + 1) * len(loader) - 1)
     valid_loss = total_loss / len(loader)
     avg_acc = total_acc / len(loader)
     avg_miou = total_iou / len(loader)
-    avg_dice = total_dice / len(loader)
 
     wandb.log({
         "valid_loss": valid_loss,
         "pixel_accuracy": avg_acc,
         "mIoU": avg_miou,
-        "mean_DICE": avg_dice
-    }, step=(epoch + 1) * train_loader_len - 1)
+    }, step=(epoch + 1) * len(loader) - 1)
         
     return valid_loss
 
@@ -157,6 +153,8 @@ def main(args):
     output_dir = os.path.join("checkpoints", args.experiment_id)
     os.makedirs(output_dir, exist_ok=True)
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     # Set seed for reproducability
     # If you add other sources of randomness (NumPy, Random), 
     # make sure to set their seeds as well
@@ -186,26 +184,25 @@ def main(args):
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
+        batch_size=8,
         shuffle=True,
-        num_workers=args.num_workers, 
+        num_workers=0, 
         pin_memory=True
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=args.batch_size,
+        batch_size=4,
         shuffle=False,
-        num_workers=args.num_workers,
+        num_workers=0, 
         pin_memory=True
     )
 
     # Use the new weights argument
-    weights = DeepLabV3_ResNet101_Weights.DEFAULT
-    model = models.deeplabv3_resnet101(weights=weights)  # do not pass num_classes here
+    weights = DeepLabV3_ResNet50_Weights.DEFAULT
+    model = models.deeplabv3_resnet50(weights=weights)
 
     # Modify the classifier to output 19 classes (for Cityscapes)
     model.classifier[4] = torch.nn.Conv2d(256, 19, kernel_size=(1, 1))
-    model.to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -222,8 +219,8 @@ def main(args):
 
     # Define the optimizer
     optimizer = torch.optim.AdamW([
-        {"params": model.backbone.parameters(), "lr": args.lr * 0.1},
-        {"params": model.classifier.parameters(), "lr": args.lr},
+        {"params": model.backbone.parameters(), "lr": 1e-5},
+        {"params": model.classifier.parameters(), "lr": 1e-4}
     ], weight_decay=1e-4)
 
     best_valid_loss = float('inf')
@@ -232,8 +229,7 @@ def main(args):
     for epoch in range(args.epochs):
         print(f"Epoch {epoch+1:04}/{args.epochs:04}")
         _ = train(train_loader, model, optimizer, criterion, epoch, device)
-        train_loader_len = len(train_loader)
-        valid_loss = validate(model, val_loader, criterion, epoch, train_loader_len, device)
+        valid_loss = validate(model, val_loader, criterion, epoch, output_dir, current_best_model_path, device)
         
         if valid_loss < best_valid_loss:
             best_valid_loss = valid_loss
