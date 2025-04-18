@@ -9,9 +9,15 @@ from torch.utils.data import DataLoader
 from torchvision.datasets import Cityscapes, wrap_dataset_for_transforms_v2
 from torchvision.utils import make_grid
 import torchvision.models.segmentation as models
-from torchvision.models.segmentation import DeepLabV3_ResNet50_Weights, DeepLabV3_ResNet101_Weights
 from utils import *
 from collections import Counter
+import torch
+import torch.nn as nn
+from torchvision.models.segmentation import (
+    deeplabv3_resnet101, deeplabv3_resnet50, deeplabv3_mobilenet_v3_large,
+    DeepLabV3_ResNet101_Weights, DeepLabV3_ResNet50_Weights, DeepLabV3_MobileNet_V3_Large_Weights
+)
+
 
 semantic_label_to_id = { i.name: i.id for i in Cityscapes.classes }
 print(semantic_label_to_id)
@@ -94,7 +100,6 @@ def get_rare_classes(num = 2000):
     rare_train_ids.discard(255)  # Remove the ignored label ID
     print("Rare train IDs:", rare_train_ids)
     return rare_train_ids
-
 
 def custom_transform(img, semantic_target):
     img = image_transform(img)
@@ -211,6 +216,33 @@ def validate(model, loader, criterion, epoch, train_loader_len, report_df, devic
     return valid_loss, avg_dice, res_df
 
 
+def get_segmentation_model(
+        model_name: str,
+        num_classes: int = 19,
+        pretrained: bool = True,
+        device: torch.device = None
+    ) -> nn.Module:
+    
+    name = model_name.lower()
+    if name == "deeplabv3_resnet101":
+        weights = DeepLabV3_ResNet101_Weights.DEFAULT if pretrained else None
+        model = deeplabv3_resnet101(weights=weights)
+    elif name == "deeplabv3_resnet50":
+        weights = DeepLabV3_ResNet50_Weights.DEFAULT if pretrained else None
+        model = deeplabv3_resnet50(weights=weights)
+    elif name == "deeplabv3_mobilenet_v3_large":
+        weights = DeepLabV3_MobileNet_V3_Large_Weights.DEFAULT if pretrained else None
+        model = deeplabv3_mobilenet_v3_large(weights=weights)
+    else:
+        raise ValueError(f"Unsupported model_name '{model_name}'")
+
+    in_channels = model.classifier[4].in_channels
+    model.classifier[4] = nn.Conv2d(in_channels, num_classes, kernel_size=1)
+
+    if device is not None:
+        model = model.to(device)
+    return model
+
 def get_args_parser():
 
     parser = ArgumentParser("Training script for a PyTorch model")
@@ -221,11 +253,19 @@ def get_args_parser():
     parser.add_argument("--num-workers", type=int, default=10, help="Number of workers for data loaders")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--experiment-id", type=str, default="unet-training", help="Experiment ID for Weights & Biases")
+    parser.add_argument("--backbone", type=str, default="deeplabv3_resnet101", help="Model backbone")
+    #parser.add_argument("--quant-mode", choices=["none", "ptq", "qat"], default="none", help="Quantization mode")
 
     return parser
 
 
 def main(args):
+
+    # print the arguments
+    print("Arguments:")
+    for arg, value in vars(args).items():
+        print(f"{arg}: {value}")
+
     # Initialize wandb for logging
     wandb.init(
         project="5lsm0-cityscapes-segmentation",  # Project name in wandb
@@ -258,11 +298,16 @@ def main(args):
 
     rare_train_ids = get_rare_classes()
 
+    underperforming_classes = ["train", "wall", "fence", "bus", "traffic light", "pole", "rider"]
+    underperforming_classes_train_ids = [semantic_label_to_train_id[label] for label in underperforming_classes if label in semantic_label_to_train_id]
+
     train_dataset = RareClassBoostedDataset(
         base_dataset=train_dataset_raw,
         id_to_trainid=id_to_trainid,
         rare_train_ids=rare_train_ids,
-        rare_sample_multiplier=3  
+        ultra_rare_train_ids=underperforming_classes_train_ids,
+        rare_sample_multiplier=3,
+        ultra_rare_sample_multiplier=4
     )
 
     # print number of samples in the train_dataset_raw
@@ -298,12 +343,17 @@ def main(args):
     )
 
     # Use the new weights argument
-    weights = DeepLabV3_ResNet101_Weights.DEFAULT
-    model = models.deeplabv3_resnet101(weights=weights)  # do not pass num_classes here
+    # weights = DeepLabV3_ResNet101_Weights.DEFAULT
+    # model = models.deeplabv3_resnet101(weights=weights)  # do not pass num_classes here
+    # model.classifier[4] = torch.nn.Conv2d(256, 19, kernel_size=(1, 1))
+    # model.to(device)
 
-    # Modify the classifier to output 19 classes (for Cityscapes)
-    model.classifier[4] = torch.nn.Conv2d(256, 19, kernel_size=(1, 1))
-    model.to(device)
+    model = get_segmentation_model(
+        model_name=args.backbone,      
+        num_classes=19,
+        pretrained=True,
+        device=device
+    )   
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -316,10 +366,10 @@ def main(args):
     })
 
     # Define the loss function
-    #criterion = nn.CrossEntropyLoss(ignore_index=255)
-    #criterion = dice_loss
-    #criterion = combined_loss
-    #criterion = focal_loss
+    # criterion = nn.CrossEntropyLoss(ignore_index=255)
+    # criterion = dice_loss
+    # criterion = combined_loss
+    # criterion = focal_loss
     
     # Get class weights
     class_weights_tensor = get_class_weights(device)
