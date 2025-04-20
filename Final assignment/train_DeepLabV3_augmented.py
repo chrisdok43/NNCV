@@ -11,13 +11,14 @@ from torchvision.utils import make_grid
 import torchvision.models.segmentation as models
 from utils import *
 from collections import Counter
+import copy
+import torch.nn.utils.prune as pr
 import torch
 import torch.nn as nn
 from torchvision.models.segmentation import (
     deeplabv3_resnet101, deeplabv3_resnet50, deeplabv3_mobilenet_v3_large,
     DeepLabV3_ResNet101_Weights, DeepLabV3_ResNet50_Weights, DeepLabV3_MobileNet_V3_Large_Weights
 )
-
 
 semantic_label_to_id = { i.name: i.id for i in Cityscapes.classes }
 print(semantic_label_to_id)
@@ -144,22 +145,96 @@ def train(loader, model, optimizer, criterion, epoch, device=None):
     return avg_loss
 
 @torch.no_grad()
-def validate(model, loader, criterion, epoch, train_loader_len, report_df, device=None):
+def validate(model, loader, criterion, epoch, train_loader_len, report_df, prune_amount=0, quant_mode=None ,device=None):
     print("Validating...")
-    model.eval()
+
+    val_model = copy.deepcopy(model)
+
+    if quant_mode == "ptq":
+        print("Applying post-training quantization...")
+        total_pre, nonzero_pre = count_params(eval_model)
+        size_pre_mb = total_pre * 4 / (1024**2)  # float32: 4 bytes each
+        wandb.log({
+            "total_params_pre_quant": total_pre,
+            "nonzero_params_pre_quant": nonzero_pre,
+            "model_size_pre_quant_MB": size_pre_mb,
+        }, step=(epoch + 1) * train_loader_len - 1)
+        print(f"Before quantization: {nonzero_pre}/{total_pre} non-zero "
+            f"({100 * nonzero_pre/total_pre:.2f}%), size ≈ {size_pre_mb:.2f} MB")
+        #eval_model = quantize_model_gpu(eval_model, device=device)
+
+        eval_model = quantize_model_ptq(eval_model, loader, device='cpu')
+        
+        total_post, nonzero_post = count_params(eval_model)
+        size_post_mb = total_post * 4 / (1024**2)
+        wandb.log({
+            "total_params_post_quant": total_post,
+            "nonzero_params_post_quant": nonzero_post,
+            "model_size_post_quant_MB": size_post_mb
+        }, step=(epoch + 1) * train_loader_len - 1)
+        print("total_post", total_post)
+        print("nonzero_post", nonzero_post)
+        
+        # print(f"After quantization:  {nonzero_post}/{total_post} non-zero "
+        #         f"({100 * nonzero_post/total_post:.2f}%), size ≈ {size_post_mb:.2f} MB")
+        print("Quantization applied.")
+
+
+    if prune_amount > 0:
+        total_pre, nonzero_pre = count_params(eval_model)
+        size_pre_mb = total_pre * 4 / (1024**2)  # float32: 4 bytes each
+        wandb.log({
+            "total_params_pre_prune": total_pre,
+            "nonzero_params_pre_prune": nonzero_pre,
+            "model_size_pre_prune_MB": size_pre_mb,
+        }, step=(epoch + 1) * train_loader_len - 1)
+        print(f"Before pruning: {nonzero_pre}/{total_pre} non-zero "
+            f"({100 * nonzero_pre/total_pre:.2f}%), size ≈ {size_pre_mb:.2f} MB")
+        print(f"Applying unstructured pruning @ {prune_amount*100:.1f}% sparsity.")
+        for module in eval_model.modules():
+            if isinstance(module, nn.Conv2d):
+                # clean up any existing masks
+                if hasattr(module, 'weight_orig'):
+                    prune.remove(module, 'weight')
+                # apply new prune mask
+                prune.l1_unstructured(module, name='weight', amount=prune_amount)
+
+        # re‑eval mode to freeze masks / batchnorm
+        eval_model.eval()
+
+        total_post, nonzero_post = count_params(eval_model)
+        size_post_mb = total_post * 4 / (1024**2)
+        wandb.log({
+            "total_params_post_prune": total_post,
+            "nonzero_params_post_prune": nonzero_post,
+            "model_size_post_prune_MB": size_post_mb,
+            "pruned_sparsity": 1 - nonzero_post / total_post
+        }, step=(epoch + 1) * train_loader_len - 1)
+        print(f"After pruning:  {nonzero_post}/{total_post} non-zero "
+              f"({100 * nonzero_post/total_post:.2f}%), size ≈ {size_post_mb:.2f} MB")
+    else:
+        print("No pruning applied.")
+
+
+    eval_model = eval_model.to(device).eval()
     total_loss = 0.0
     total_acc, total_iou, total_dice = 0, 0, 0
 
     for i, (images, labels) in enumerate(loader):
         print(f"Batch in Validating {i+1}/{len(loader)}")
+
         images = images.to(device)
+        params = list(eval_model.parameters())
+        if params and params[0].dtype == torch.float16:
+            images = images.half()
+
         labels = labels.to(device)
 
-        model_name = model.__class__.__name__
+        model_name = eval_model.__class__.__name__
         if model_name == "DeepLabV3":
-            outputs = model(images)["out"]
+            outputs = eval_model(images)["out"]
         else:   
-            outputs = model(images)  
+            outputs = eval_model(images)  
                   
         loss = criterion(outputs, labels)
         total_loss += loss.item()
@@ -254,36 +329,30 @@ def get_args_parser():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--experiment-id", type=str, default="unet-training", help="Experiment ID for Weights & Biases")
     parser.add_argument("--backbone", type=str, default="deeplabv3_resnet101", help="Model backbone")
-    #parser.add_argument("--quant-mode", choices=["none", "ptq", "qat"], default="none", help="Quantization mode")
+    parser.add_argument("--quant_mode", choices=["none", "ptq", "qat"], default="none", help="Quantization mode")
+    parser.add_argument("--prune", type=float, default=0, help="Unstructured pruning percentage")
 
     return parser
 
 
 def main(args):
 
-    # print the arguments
     print("Arguments:")
     for arg, value in vars(args).items():
         print(f"{arg}: {value}")
 
-    # Initialize wandb for logging
     wandb.init(
-        project="5lsm0-cityscapes-segmentation",  # Project name in wandb
-        name=args.experiment_id,  # Experiment name in wandb
-        config=vars(args),  # Save hyperparameters
+        project="5lsm0-cityscapes-segmentation", 
+        name=args.experiment_id,  
+        config=vars(args),  
     )
 
-    # Create output directory if it doesn't exist
     output_dir = os.path.join("checkpoints", args.experiment_id)
     os.makedirs(output_dir, exist_ok=True)
 
-    # Set seed for reproducability
-    # If you add other sources of randomness (NumPy, Random), 
-    # make sure to set their seeds as well
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = True
 
-    # Define the device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     print(f"Starting creation of the datasets...")
@@ -310,10 +379,8 @@ def main(args):
         ultra_rare_sample_multiplier=4
     )
 
-    # print number of samples in the train_dataset_raw
     print(f"Number of samples in the original dataset: {len(train_dataset_raw)}")
 
-    # print number of samples in the train_dataset
     print(f"Number of samples in the boosted dataset: {len(train_dataset)}")
 
     val_dataset = Cityscapes(
@@ -341,12 +408,6 @@ def main(args):
         num_workers=args.num_workers,
         pin_memory=True
     )
-
-    # Use the new weights argument
-    # weights = DeepLabV3_ResNet101_Weights.DEFAULT
-    # model = models.deeplabv3_resnet101(weights=weights)  # do not pass num_classes here
-    # model.classifier[4] = torch.nn.Conv2d(256, 19, kernel_size=(1, 1))
-    # model.to(device)
 
     model = get_segmentation_model(
         model_name=args.backbone,      
@@ -398,11 +459,10 @@ def main(args):
         print(f"Epoch {epoch+1:04}/{args.epochs:04}")
         _ = train(train_loader, model, optimizer, criterion, epoch, device)
         train_loader_len = len(train_loader)
-        valid_loss, mean_dice, report_df  = validate(model, val_loader, criterion, epoch, train_loader_len, report_df, device)
+        valid_loss, mean_dice, report_df  = validate(model, val_loader, criterion, epoch, train_loader_len, report_df, args.prune, args.quant_mode, device)
         
         if mean_dice > best_dice:
             best_dice = mean_dice
-            # Optionally remove the previous best model if exists
             if current_best_model_path is not None:
                 os.remove(current_best_model_path)
             current_best_model_path = os.path.join(
